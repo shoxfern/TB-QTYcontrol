@@ -6,6 +6,7 @@
  * 1. 所有寫入皆採 Firebase 多路徑原子更新，同步寫入 public_view、audit_logs 與 sync_queue。
  * 2. 外部即時同步刷新時，絕不清空使用者正在填寫的現場表單或 BOM 草稿。
  * 3. 本機展示模式可直接模擬管理員登入，離線即可完整測試所有主控台功能。
+ * 4. 修正載入順序與登入驗證觸發時機，確保彈窗選完 Gmail 後立即解鎖主控台或明確提示白名單狀態。
  */
 
 window.AppConsole = (function () {
@@ -16,7 +17,9 @@ window.AppConsole = (function () {
   const LAST_WORKLOG_KEY = 'factory_wms_last_worklog_v1';
 
   const CState = {
+    initialized: false,
     mounted: false,
+    isVerifyingAuth: false,
     fieldType: 'WORKLOG', // INBOUND | WORKLOG | OUTBOUND | ADJUST
     replacesTxId: null,
     ledgerSearch: '',
@@ -26,8 +29,7 @@ window.AppConsole = (function () {
     auditLogs: {},
     bomEditorOpen: false,
     bomDraft: null,
-    listenersAttached: false,
-    modalResolve: null
+    listenersAttached: false
   };
 
   /* ==================== 0. 注入主控台專屬樣式（免修改 style.css） ==================== */
@@ -134,6 +136,12 @@ window.AppConsole = (function () {
     return Date.now();
   }
 
+  function ensureFirebaseRefs() {
+    if (S.isDemoMode || typeof firebase === 'undefined' || !firebase.apps || !firebase.apps.length) return;
+    if (!S.db) S.db = firebase.database();
+    if (!S.authInstance) S.authInstance = firebase.auth();
+  }
+
   function openReasonModal({ title, message, warningHtml = '', placeholder = '請輸入原因（必填）', confirmText = '確認送出' }) {
     return new Promise(resolve => {
       const wrap = document.createElement('div');
@@ -224,7 +232,9 @@ window.AppConsole = (function () {
       return;
     }
 
+    ensureFirebaseRefs();
     if (!S.db) return;
+
     S.db.ref('private_console/audit_logs').limitToLast(200).on('value', snap => {
       CState.auditLogs = snap.val() || {};
       if (S.auth.role === 'admin' && CState.adminSubTab === 'audit') renderAdminPanel();
@@ -243,7 +253,17 @@ window.AppConsole = (function () {
       resetAuthState();
       return;
     }
-    const key = user.email.replace(/\./g, ',');
+
+    const emailLower = user.email.trim().toLowerCase();
+    if (S.auth.isAuthorized && S.auth.email.toLowerCase() === emailLower) {
+      return;
+    }
+    if (CState.isVerifyingAuth) return;
+    CState.isVerifyingAuth = true;
+
+    ensureFirebaseRefs();
+    const key = emailToKey(emailLower);
+
     try {
       const snap = await S.db.ref(`private_console/whitelist/${key}`).once('value');
       const rec = snap.val();
@@ -252,26 +272,29 @@ window.AppConsole = (function () {
           user,
           isAuthorized: true,
           role: rec.role,
-          alias: rec.alias || user.displayName || user.email.split('@')[0],
-          email: user.email
+          alias: rec.alias || user.displayName || emailLower.split('@')[0],
+          email: emailLower
         };
         applyAuthUi();
         E.showToast(`歡迎回到主控台：${S.auth.alias}（${rec.role === 'admin' ? '管理員' : '操作員'}）`, 'success');
       } else {
-        await S.authInstance.signOut();
+        if (S.authInstance) await S.authInstance.signOut();
         resetAuthState();
-        alert(`帳號待管理員開通！\n\n您的 Gmail：${user.email}\n系統鍵值：${key}\n\n請將此 Gmail 交給管理員加入白名單後再重新登入。`);
+        alert(`帳號待管理員開通！\n\n您的 Gmail：${emailLower}\n系統鍵值：${key}\n\n請確認 Firebase Realtime Database 的 private_console/whitelist/${key} 已建立且 active 為布林值 true。`);
       }
     } catch (err) {
-      await S.authInstance.signOut();
+      if (S.authInstance) await S.authInstance.signOut();
       resetAuthState();
-      E.showToast('驗證白名單失敗（尚未開通權限）：' + err.message, 'error');
+      E.showToast('驗證白名單失敗：' + err.message, 'error');
+    } finally {
+      CState.isVerifyingAuth = false;
     }
   }
 
   function resetAuthState() {
     S.auth = { user: null, isAuthorized: false, role: 'public', alias: '', email: '' };
     CState.listenersAttached = false;
+    CState.mounted = false;
     applyAuthUi();
   }
 
@@ -288,24 +311,31 @@ window.AppConsole = (function () {
       E.showToast('已進入展示主控台（管理員權限，所有異動僅存於本機記憶體）', 'success');
       return;
     }
+
+    ensureFirebaseRefs();
     if (!S.authInstance) {
-      E.showToast('Firebase Auth 尚未就緒', 'error');
+      E.showToast('Firebase Auth 尚未就緒，請重新整理網頁', 'error');
       return;
     }
+
     const provider = new firebase.auth.GoogleAuthProvider();
     provider.setCustomParameters({ prompt: 'select_account' });
     try {
-      await S.authInstance.signInWithPopup(provider);
+      const result = await S.authInstance.signInWithPopup(provider);
+      if (result && result.user) {
+        await verifyWhitelistedUser(result.user);
+      }
     } catch (err) {
       if (err.code === 'auth/popup-blocked') {
         await S.authInstance.signInWithRedirect(provider);
-      } else if (err.code !== 'auth/popup-closed-by-user') {
+      } else if (err.code !== 'auth/popup-closed-by-user' && err.code !== 'auth/cancelled-popup-request') {
         E.showToast('Google 登入失敗：' + err.message, 'error');
       }
     }
   }
 
   async function handleLogoutClick() {
+    ensureFirebaseRefs();
     if (!S.isDemoMode && S.authInstance) {
       await S.authInstance.signOut();
     }
@@ -317,12 +347,12 @@ window.AppConsole = (function () {
   async function commitMultiPath(updates) {
     if (S.isDemoMode) {
       Object.keys(updates).forEach(path => {
-        const val = updates[path];
-        applyDemoPath(path, val);
+        applyDemoPath(path, updates[path]);
       });
       E.recomputeAndRender();
       return;
     }
+    ensureFirebaseRefs();
     await S.db.ref().update(updates);
   }
 
@@ -384,7 +414,6 @@ window.AppConsole = (function () {
         }
       }
     });
-    // 依交易建立時間近似 FIFO（INIT 優先）
     return list.sort((a, b) => {
       if (a.lotNo === 'INIT') return -1;
       if (b.lotNo === 'INIT') return 1;
@@ -854,7 +883,6 @@ window.AppConsole = (function () {
           }).join('')}
         </div>`;
 
-        // 綁定混批新增 / 刪除按鈕
         matBox.querySelectorAll('[data-add-split]').forEach(btn => {
           btn.addEventListener('click', () => {
             const idx = btn.dataset.addSplit;
@@ -877,14 +905,12 @@ window.AppConsole = (function () {
         });
       }
 
-      // 批號沿用模式或自動產生生產批號
       if (autoResetLot || !lotInp.value) {
         if (st.inheritLot) {
           const firstSplitLot = matBox.querySelector('.split-lot');
           if (firstSplitLot && firstSplitLot.value && firstSplitLot.value !== 'UNASSIGNED-NEG') {
             lotInp.value = firstSplitLot.value;
           } else if (prevSt) {
-            // 尋找同型號上一站最近一次有效報工批號
             const recentPrev = Object.values(S.transactions || {})
               .filter(t => t && t.status === 'ACTIVE' && t.txType === 'WORKLOG' && t.itemCode === outCode && String(t.stepSeq) === String(prevSt.seq))
               .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0];
@@ -1096,7 +1122,6 @@ window.AppConsole = (function () {
     }
     if (!lotNo) return E.showToast('請填寫生產／產出批號', 'error');
 
-    // 收集混批材料消耗明細
     const consumedLots = [];
     if (!isRework) {
       const matCards = document.querySelectorAll('#wk-materials-box .mat-alloc-card');
@@ -1137,7 +1162,6 @@ window.AppConsole = (function () {
       await submitStandardTx(tx, {
         reason: document.getElementById('wk-note').value.trim()
       });
-      // 記住本次報工供下次一鍵延續
       localStorage.setItem(LAST_WORKLOG_KEY, JSON.stringify({
         itemCode: outCode, stepSeq: st.seq, processName: st.processName, lotNo
       }));
@@ -1309,7 +1333,6 @@ window.AppConsole = (function () {
       return E.showToast('該筆單據不可作廢', 'error');
     }
 
-    // 連鎖作廢防呆檢查
     const downstreamUsed = checkDownstreamConsumption(orig);
     let warningHtml = '';
     if (downstreamUsed > 0) {
@@ -1334,7 +1357,6 @@ window.AppConsole = (function () {
     const qVoidId = genId('QV');
     const qRevId = genId('QR');
 
-    // 建立完整對應的負數沖銷交易
     const revTx = {
       txId: revTxId,
       txType: 'REVERSAL',
@@ -1360,11 +1382,8 @@ window.AppConsole = (function () {
     };
 
     const updates = {
-      // 1. 標記原單 VOIDED（不更動不可變欄位，完全通過 database.rules.json 驗證）
       [`public_view/transactions/${orig.txId}/status`]: 'VOIDED',
-      // 2. 新增負數沖銷單
       [`public_view/transactions/${revTxId}`]: revTx,
-      // 3. 寫入兩筆操作履歷（標記作廢＋寫入沖銷）
       [`private_console/audit_logs/${logVoidId}`]: {
         logId: logVoidId, action: 'TX_VOID', refTxId: orig.txId,
         operatorEmail: S.auth.email, operatorAlias: S.auth.alias,
@@ -1375,7 +1394,6 @@ window.AppConsole = (function () {
         operatorEmail: S.auth.email, operatorAlias: S.auth.alias,
         customerOrTarget: '', reason: `沖銷原單 ${orig.txId}：${reason}`, serverTime: ts
       },
-      // 4. 寫入 GAS 背景同步佇列（確保試算表原單標 VOIDED 且新增沖銷列）
       [`private_console/sync_queue/${qVoidId}`]: {
         logId: logVoidId, action: 'TX_VOID', refTxId: orig.txId,
         operatorEmail: S.auth.email, operatorAlias: S.auth.alias,
@@ -1389,7 +1407,6 @@ window.AppConsole = (function () {
       'private_console/sync_flags/mirrorDirty': true
     };
 
-    // 若作廢的是綁定排程的出貨單，同步回補該排程欠數
     if (orig.txType === 'OUTBOUND' && orig.schedId && S.schedules[orig.schedId]) {
       const sc = S.schedules[orig.schedId];
       const backShipped = E.roundQty(Math.max(0, (Number(sc.shippedQty) || 0) - (Number(orig.goodQty) || 0)));
@@ -1430,7 +1447,6 @@ window.AppConsole = (function () {
     const mount = document.getElementById('console-bom-mount');
     if (!mount || S.auth.role !== 'admin') return;
 
-    // 避免外部資料刷新時覆蓋正在編輯中的 BOM 草稿
     if (CState.bomEditorOpen && CState.bomDraft && mount.querySelector('#bom-editor-body')) {
       renderBomLivePreview();
       return;
@@ -1504,7 +1520,7 @@ window.AppConsole = (function () {
         { seq: 20, processName: '清潔', scrapRate: 0.01, isOutsourced: false, inheritLot: true, inputs: [] }
       ];
     } else if (pattern === 'DIRECT_ASSEMBLY') {
-      const twoRaws = Object.keys(S.items).filter(c => c.type !== 'FG' && c !== CState.bomDraft.outCode).slice(0, 2);
+      const twoRaws = Object.keys(S.items).filter(c => S.items[c].type !== 'FG' && c !== CState.bomDraft.outCode).slice(0, 2);
       CState.bomDraft.steps = [
         {
           seq: 10, processName: '組裝', scrapRate: 0.02, isOutsourced: false, inheritLot: false,
@@ -1623,7 +1639,6 @@ window.AppConsole = (function () {
         <div class="bom-preview-box" id="bom-live-preview"></div>
       </div>`;
 
-    // 綁定範本、增刪站、調序與欄位變更
     body.querySelectorAll('[data-tpl]').forEach(btn => {
       btn.addEventListener('click', () => applyBomTemplate(btn.dataset.tpl));
     });
@@ -1723,7 +1738,6 @@ window.AppConsole = (function () {
     const activeWips = E.getBomStepWip(draft.outCode);
     const tempBoms = Object.assign({}, S.boms, { [draft.outCode]: draft });
 
-    // 遞迴展開每 1 單位的理論與含損耗底層原料總需求
     const leafTotals = {};
     const expandTreeHtml = (code, qtyTheo, qtyWithScrap, depth) => {
       if (depth > 8) return `<div class="preview-tree-item">⚠️ 層級過深</div>`;
@@ -1784,12 +1798,10 @@ window.AppConsole = (function () {
     if (!draft || !draft.steps || draft.steps.length === 0) {
       return E.showToast('配方至少需包含 1 道製程站', 'error');
     }
-    // 1. 循環參照防呆
     const cycle = E.checkBomCycle(draft.outCode, draft.steps, S.boms);
     if (cycle) {
       return E.showToast(`禁止存檔：偵測到循環參照 ${cycle.join(' → ')}`, 'error');
     }
-    // 2. 首站材料檢查
     if (!draft.steps[0].inputs || draft.steps[0].inputs.length === 0) {
       return E.showToast('首站必須至少指定 1 項投入材料與數量', 'error');
     }
@@ -1801,7 +1813,6 @@ window.AppConsole = (function () {
       }
     }
 
-    // 3. WIP 殘留防護鎖：檢查是否有舊站別被刪除且尚有非 0 WIP
     const newSeqSet = new Set(draft.steps.map(s => String(s.seq)));
     const orphanWips = E.getBomStepWip(draft.outCode).filter(w => {
       const m = w.label.match(/^站(\d+)/);
@@ -2173,7 +2184,11 @@ window.AppConsole = (function () {
 
   /* ==================== 7. 啟動與掛勾註冊 ==================== */
   function initConsole() {
+    if (CState.initialized) return;
+    CState.initialized = true;
+
     injectConsoleStyles();
+    ensureFirebaseRefs();
 
     const loginBtn = document.getElementById('btn-login-console');
     const logoutBtn = document.getElementById('btn-logout-console');
@@ -2200,7 +2215,12 @@ window.AppConsole = (function () {
       }
     });
   }
-window.addEventListener('load', initConsole);
+
+  if (document.readyState === 'complete') {
+    initConsole();
+  } else {
+    window.addEventListener('load', initConsole);
+  }
 
   return { handleLoginClick, handleLogoutClick };
 })();
