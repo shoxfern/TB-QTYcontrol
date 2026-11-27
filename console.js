@@ -2200,12 +2200,7 @@ window.AppConsole = (function () {
       }
     });
   }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initConsole);
-  } else {
-    initConsole();
-  }
+window.addEventListener('load', initConsole);
 
   return { handleLoginClick, handleLogoutClick };
 })();
