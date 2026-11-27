@@ -11,10 +11,10 @@
  */
 
 // ==================== 請貼上你的 Firebase Web App 設定 ====================
-const firebaseConfig = {
+const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBk2kStuqO_OxBKvvTcU44nghJqfr9E2A8", // 請至 Firebase 主控台的專案設定中取得
   authDomain: "pc-control-a3d35.firebaseapp.com",
-  databaseURL: "https://pc-control-a3d35-default-rtdb.europe-west1.firebasedatabase.app",
+  databaseURL: "https://pc-control-a3d35-default-rtdb.europe-west1.firebasedatabase.app/",
   projectId: "pc-control-a3d35",
   storageBucket: "pc-control-a3d35.firebasestorage.app", // 亦可使用 pc-control-a3d35.appspot.com
   messagingSenderId: "24088661658",
