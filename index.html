@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>現場物料與多階製程管理系統</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body class="mode-desktop">
+  <!-- 模擬試算沙盒頂部警示條 -->
+  <div id="whatif-banner" class="whatif-banner hidden">
+    <span>🧪 <strong>模擬試算沙盒模式（What-if）運作中</strong> — 目前僅於瀏覽器記憶體模擬，不會更動 Firebase 與試算表正式帳目</span>
+    <button type="button" class="btn btn-sm btn-light" id="btn-exit-whatif">退出並清除模擬</button>
+  </div>
+
+  <!-- 本機展示模式提示條 -->
+  <div id="demo-banner" class="demo-banner hidden">
+    <span>📦 <strong>本機展示模式</strong>（尚未填入 Firebase 設定，目前顯示內建範例資料；填入 engine.js 的 FIREBASE_CONFIG 後即連線正式資料庫）</span>
+  </div>
+
+  <!-- 頂部導覽列 -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="brand-logo">🏭</div>
+      <div>
+        <h1 class="brand-title">現場物料與製程看板</h1>
+        <div class="brand-sub" id="sync-status-text">連線初始化中...</div>
+      </div>
+    </div>
+
+    <div class="topbar-right">
+      <button type="button" class="btn btn-outline btn-sm" id="btn-toggle-mode" title="手動切換電腦管理版 / 手機現場版">
+        📱 切換手機現場版
+      </button>
+
+      <!-- 未登入顯示 -->
+      <button type="button" class="btn btn-primary btn-sm" id="btn-login-console">
+        🔐 主控台登入 (Gmail)
+      </button>
+
+      <!-- 已登入主控台顯示 -->
+      <div id="auth-user-box" class="auth-user-box hidden">
+        <span class="role-badge" id="auth-role-badge">操作員</span>
+        <span class="user-alias" id="auth-user-alias">--</span>
+        <button type="button" class="btn btn-outline btn-sm" id="btn-logout-console">登出</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- 主分頁導覽列 -->
+  <nav class="main-nav" id="main-nav">
+    <button type="button" class="nav-tab active" data-tab="inventory">📊 即時庫存</button>
+    <button type="button" class="nav-tab" data-tab="readiness">🚦 出貨齊料評估</button>
+    <button type="button" class="nav-tab" data-tab="whatif">🧪 模擬試算</button>
+    <button type="button" class="nav-tab" data-tab="trace">🔍 雙向批號追溯</button>
+    <button type="button" class="nav-tab" data-tab="bom">🧩 製程 BOM</button>
+
+    <!-- 登入白名單主控台後解鎖 -->
+    <button type="button" class="nav-tab console-only hidden" data-tab="field">⚡ 現場登錄</button>
+    <button type="button" class="nav-tab console-only hidden" data-tab="ledger">📑 流水帳/作廢</button>
+    <button type="button" class="nav-tab admin-only hidden" data-tab="admin">🛡️ 主控台管理</button>
+  </nav>
+
+  <!-- 主內容區 -->
+  <main class="container">
+    <!-- 全局紅黃綠燈 KPI 摘要列 -->
+    <section class="kpi-grid" id="kpi-summary">
+      <div class="kpi-card kpi-red" id="kpi-red-card">
+        <div class="kpi-label">🔴 缺料／異常警報</div>
+        <div class="kpi-value" id="kpi-red-count">0</div>
+        <div class="kpi-desc" id="kpi-red-desc">尚無紅燈排程或負庫存</div>
+      </div>
+      <div class="kpi-card kpi-yellow">
+        <div class="kpi-label">🟡 損耗風險／低安全量</div>
+        <div class="kpi-value" id="kpi-yellow-count">0</div>
+        <div class="kpi-desc">建議提前備料或留意良率</div>
+      </div>
+      <div class="kpi-card kpi-green">
+        <div class="kpi-label">🟢 齊料排程數</div>
+        <div class="kpi-value" id="kpi-green-count">0</div>
+        <div class="kpi-desc">含不良率緩衝皆足量</div>
+      </div>
+      <div class="kpi-card kpi-blue">
+        <div class="kpi-label">⚙️ 站間在製品 (WIP)</div>
+        <div class="kpi-value" id="kpi-wip-count">0</div>
+        <div class="kpi-desc" id="kpi-rework-desc">待重工池：0</div>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 1：即時庫存與 WIP ==================== -->
+    <section id="panel-inventory" class="tab-panel active">
+      <div class="panel-header">
+        <div>
+          <h2>即時庫存與站間 WIP 總表</h2>
+          <p class="muted">公開檢視已自動去識別化；庫存數字即時彙總期初、進貨、報工扣料與作廢沖銷。</p>
+        </div>
+        <div class="panel-actions">
+          <button type="button" class="btn btn-outline btn-sm" id="btn-export-csv">⬇️ 匯出目前篩選 CSV</button>
+        </div>
+      </div>
+
+      <div class="filter-bar">
+        <input type="text" id="inv-search" class="input" placeholder="搜尋型號、品名、批號或備註..." />
+        <div class="chip-group" id="inv-type-chips">
+          <button type="button" class="chip active" data-filter="ALL">全部</button>
+          <button type="button" class="chip" data-filter="RAW">原料 RAW</button>
+          <button type="button" class="chip" data-filter="SEMI">半成品 SEMI</button>
+          <button type="button" class="chip" data-filter="FG">成品 FG</button>
+          <button type="button" class="chip chip-danger" data-filter="ALERT">只看異常／低庫存</button>
+          <button type="button" class="chip" data-filter="WIP">只看有 WIP</button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="data-table" id="inv-table">
+          <thead>
+            <tr>
+              <th>型號 / 品名</th>
+              <th>類別</th>
+              <th class="num">即時可用</th>
+              <th class="num">安全庫存</th>
+              <th>狀態燈號</th>
+              <th>站間 WIP / 待重工</th>
+              <th>現有批號餘量</th>
+            </tr>
+          </thead>
+          <tbody id="inv-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 2：出貨齊料評估 ==================== -->
+    <section id="panel-readiness" class="tab-panel">
+      <div class="panel-header">
+        <div>
+          <h2>出貨排程齊料評估（多階倒推含 WIP 與製程損耗）</h2>
+          <p class="muted">依預計出貨日與優先序預扣共用料池；由最終站倒推至原料，先抵成品現貨與站間 WIP 再算各站良率。</p>
+        </div>
+        <div class="panel-actions">
+          <button type="button" class="btn btn-outline btn-sm" id="btn-goto-whatif">🧪 帶入模擬試算</button>
+        </div>
+      </div>
+
+      <div id="readiness-list" class="card-stack"></div>
+    </section>
+
+    <!-- ==================== TAB 3：What-if 模擬試算沙盒 ==================== -->
+    <section id="panel-whatif" class="tab-panel">
+      <div class="panel-header">
+        <div>
+          <h2>模擬試算模式（What-if 沙盒）</h2>
+          <p class="muted">自由測試「臨時插急單」、「模擬原料提早進貨」或「某站不良率惡化」，即時查看對既有排程的搶料衝擊。</p>
+        </div>
+        <div class="panel-actions">
+          <button type="button" class="btn btn-danger btn-sm" id="btn-reset-whatif">🔄 重置全部模擬參數</button>
+        </div>
+      </div>
+
+      <div class="whatif-grid">
+        <!-- 1. 模擬插單 -->
+        <div class="card">
+          <h3>1. 模擬新增急單／出貨排程</h3>
+          <div class="form-row">
+            <label>型號（成品或半成品）</label>
+            <select id="wf-order-item" class="input"></select>
+          </div>
+          <div class="form-row-2">
+            <div>
+              <label>模擬數量</label>
+              <input type="number" id="wf-order-qty" class="input" min="1" value="30" />
+            </div>
+            <div>
+              <label>預計出貨日</label>
+              <input type="date" id="wf-order-date" class="input" />
+            </div>
+          </div>
+          <div class="form-row">
+            <label>優先權（數字越小越先搶料）</label>
+            <input type="number" id="wf-order-priority" class="input" min="1" max="99" value="1" />
+          </div>
+          <button type="button" class="btn btn-primary btn-block" id="btn-wf-add-order">＋ 加入模擬排程</button>
+          <ul id="wf-order-list" class="mini-list"></ul>
+        </div>
+
+        <!-- 2. 模擬進貨補料 -->
+        <div class="card">
+          <h3>2. 模擬原料／半成品進貨</h3>
+          <div class="form-row">
+            <label>補充料號</label>
+            <select id="wf-stock-item" class="input"></select>
+          </div>
+          <div class="form-row">
+            <label>模擬增加庫存數量</label>
+            <input type="number" id="wf-stock-qty" class="input" value="100" />
+          </div>
+          <button type="button" class="btn btn-primary btn-block" id="btn-wf-add-stock">＋ 加入模擬庫存</button>
+          <ul id="wf-stock-list" class="mini-list"></ul>
+        </div>
+
+        <!-- 3. 模擬不良率變動 -->
+        <div class="card">
+          <h3>3. 模擬製程不良率異常</h3>
+          <div class="form-row">
+            <label>選擇配方與站別</label>
+            <select id="wf-scrap-target" class="input"></select>
+          </div>
+          <div class="form-row">
+            <label>模擬不良率（%）</label>
+            <input type="number" id="wf-scrap-rate" class="input" min="0" max="90" step="0.5" value="10" />
+          </div>
+          <button type="button" class="btn btn-primary btn-block" id="btn-wf-add-scrap">＋ 套用模擬良率</button>
+          <ul id="wf-scrap-list" class="mini-list"></ul>
+        </div>
+      </div>
+
+      <h3 class="section-subtitle">模擬後全廠排程齊料衝擊結果</h3>
+      <div id="whatif-result-list" class="card-stack"></div>
+    </section>
+
+    <!-- ==================== TAB 4：雙向批號追溯 ==================== -->
+    <section id="panel-trace" class="tab-panel">
+      <div class="panel-header">
+        <div>
+          <h2>雙向批號追溯查詢</h2>
+          <p class="muted">輸入成品批號可<strong>反向追查</strong>各階製程與最底層原料；輸入瑕疵原料批號可<strong>正向攔截</strong>已流出至下一端的成品。</p>
+        </div>
+      </div>
+
+      <div class="card trace-search-card">
+        <div class="trace-input-row">
+          <input type="text" id="trace-lot-input" class="input" list="trace-lot-datalist" placeholder="輸入或選擇原料批號／生產批號（例如 LOT-A01）..." />
+          <datalist id="trace-lot-datalist"></datalist>
+          <button type="button" class="btn btn-primary" id="btn-run-trace">🔍 立即雙向追溯</button>
+        </div>
+        <div class="quick-lot-chips" id="quick-lot-chips"></div>
+      </div>
+
+      <div id="trace-output" class="trace-output">
+        <div class="empty-state">請輸入批號或點擊上方快速批號標籤開始追溯。</div>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 5：製程 BOM（唯讀檢視 ＋ 管理員編輯器掛載點） ==================== -->
+    <section id="panel-bom" class="tab-panel">
+      <div class="panel-header">
+        <div>
+          <h2>多階製程 BOM 配方總覽</h2>
+          <p class="muted">支援單料多製程、多料直接組裝與多製程半成品複合組裝；管理員登入主控台後可在此直接視覺化編輯。</p>
+        </div>
+      </div>
+
+      <!-- 第 3 部分 console.js 管理員 BOM 編輯器掛載區 -->
+      <div id="console-bom-mount" class="hidden"></div>
+
+      <!-- 公開唯讀 BOM 卡片與展階檢視 -->
+      <div id="public-bom-viewer" class="bom-viewer-grid"></div>
+    </section>
+
+    <!-- ==================== 第 3 部分 console.js 專屬主控台分頁 ==================== -->
+    <section id="panel-field" class="tab-panel console-only hidden">
+      <div id="console-field-mount">
+        <div class="empty-state">請載入第 3 部分 <code>console.js</code> 以啟用現場登錄表單。</div>
+      </div>
+    </section>
+
+    <section id="panel-ledger" class="tab-panel console-only hidden">
+      <div id="console-ledger-mount">
+        <div class="empty-state">請載入第 3 部分 <code>console.js</code> 以啟用流水帳與作廢沖銷功能。</div>
+      </div>
+    </section>
+
+    <section id="panel-admin" class="tab-panel admin-only hidden">
+      <div id="console-admin-mount">
+        <div class="empty-state">請載入第 3 部分 <code>console.js</code> 以啟用白名單權限與 Audit Log 管理。</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 手機現場版底部快捷導覽列 -->
+  <footer class="mobile-bottom-nav" id="mobile-bottom-nav">
+    <button type="button" class="mnav-btn active" data-tab="inventory">📊<span>庫存</span></button>
+    <button type="button" class="mnav-btn" data-tab="readiness">🚦<span>齊料</span></button>
+    <button type="button" class="mnav-btn console-only hidden" data-tab="field">⚡<span>登錄</span></button>
+    <button type="button" class="mnav-btn" data-tab="trace">🔍<span>追溯</span></button>
+    <button type="button" class="mnav-btn" data-tab="whatif">🧪<span>試算</span></button>
+  </footer>
+
+  <!-- Toast 通知容器 -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <!-- Firebase Compat SDK (免建置工具，GitHub Pages 直接執行) -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+
+  <!-- 第 2 部分核心引擎 -->
+  <script src="engine.js"></script>
+  <!-- 第 3 部分主控台與 BOM 編輯器（尚未放入時不影響公開檢視運行） -->
+  <script src="console.js" defer></script>
+</body>
+</html>
